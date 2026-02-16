@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Video Files (Exclude user data!)
+*.MP4
+*.mp4
+*.MOV
+*.mov
+*.AVI
+*.avi
+*.MKV
+*.mkv
+
+# Subtitle Files
+*.SRT
+*.srt
+
+# Logs and Summaries
+injection_summary.txt
+*.log
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# MacOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
