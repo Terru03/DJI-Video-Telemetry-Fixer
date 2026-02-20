@@ -1,6 +1,8 @@
 import os
 import re
 import math
+import json
+import time
 import argparse
 import subprocess
 import datetime
@@ -8,6 +10,9 @@ import shutil
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+
+# Global tracking set for processed files (loaded in main)
+_processed_set = set()
 
 # Lock for clean console output during multi-threading
 print_lock = threading.Lock()
@@ -197,9 +202,10 @@ def check_ffmpeg():
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
-def embed_subtitle(video_path, srt_path):
+def embed_subtitle(video_path, srt_path, metadata=None):
     """
     Embeds the SRT file as a subtitle track into the video using ffmpeg.
+    Optionally sets creation_time metadata during the same remux pass.
     Returns True if successful, False otherwise.
     """
     # Create a temp output file
@@ -210,18 +216,23 @@ def embed_subtitle(video_path, srt_path):
     # FFmpeg command to embed subtitle
     # -c copy (copy video/audio streams)
     # -c:s mov_text (convert srt to mp4 compatible subtitle)
-    # -metadata:s:s:0 language=eng (set language)
+    # -movflags +faststart (move moov atom to start for better playback/seeking)
     cmd = [
         'ffmpeg', '-y', # Overwrite temp if exists
         '-i', video_path,
         '-i', srt_path,
         '-c', 'copy',
         '-c:s', 'mov_text',
+        '-movflags', '+faststart',
         '-metadata:s:s:0', 'language=eng',
         '-metadata:s:s:0', 'handler_name=Telemetry',
         '-metadata:s:s:0', 'title=DJI Telemetry',
-        temp_output
     ]
+    # Piggyback creation_time during remux to reduce exiftool work
+    if metadata and 'datetime' in metadata:
+        creation_time = metadata['datetime'].replace(' ', 'T')
+        cmd.extend(['-metadata', f'creation_time={creation_time}'])
+    cmd.append(temp_output)
     
     safe_print(f"Embedding SRT into {base_name}...")
     try:
@@ -245,16 +256,22 @@ def embed_subtitle(video_path, srt_path):
 def check_if_processed(video_path):
     """
     Checks if the video has already been processed by looking for specific metadata.
+    Uses a tracking file first for near-instant checks, then falls back to exiftool.
     Returns True if valid DJI metadata or subtitle track is found.
     """
+    # Fast path: check in-memory tracking set (loaded from .dji_processed.json)
+    if os.path.basename(video_path) in _processed_set:
+        return True
+    
     try:
-        # Check for our injected Model tag
+        # Check for our injected Model tag (-fast reads only file header, much less I/O)
         result = subprocess.run(
-            ['exiftool', '-Model', '-s3', video_path],
+            ['exiftool', '-fast', '-Model', '-s3', video_path],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
         )
         model = result.stdout.strip()
         if "DJI Mini 3 Pro" in model:
+            _processed_set.add(os.path.basename(video_path))
             return True
             
         # Check for Telemetry subtitle track using ffprobe (if available)
@@ -267,6 +284,7 @@ def check_if_processed(video_path):
             ]
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
             if "DJI Telemetry" in result.stdout:
+                _processed_set.add(os.path.basename(video_path))
                 return True
                 
     except Exception:
@@ -278,7 +296,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 def process_single_video(video_info):
     """Worker function for parallel processing."""
-    export_path, matched_srt, has_ffmpeg, force, delete_source, source_map, video_count, current_idx = video_info
+    export_path, matched_srt, has_ffmpeg, force, delete_source, source_map, video_count, current_idx, no_subtitle = video_info
     filename = os.path.basename(export_path)
     
     safe_print(f"[{current_idx}/{video_count}] Processing {filename}...")
@@ -290,25 +308,26 @@ def process_single_video(video_info):
              recycle_source(matched_srt, export_path)
         return "already_processed"
     
-    # 1. Embed Subtitle
-    srt_ok = True
-    if has_ffmpeg:
-        srt_ok = embed_subtitle(export_path, matched_srt)
-    
-    # 2. Inject Metadata
-    meta_ok = False
+    # 0. Parse metadata first (needed for both ffmpeg and exiftool)
     metadata = parse_srt_data(matched_srt)
-    final_status = "error"
-    
-    if metadata:
-        inject_metadata(export_path, metadata)
-        meta_ok = True
-        final_status = f"success|{filename}|{metadata.get('datetime','?')}|{metadata.get('latitude',0)},{metadata.get('longitude',0)}"
-    else:
+    if not metadata:
         safe_print(f"  Warning: Could not extract metadata from {os.path.basename(matched_srt)}")
+        return "error"
+    
+    # 1. Embed Subtitle (pass metadata so ffmpeg can set creation_time in same pass)
+    srt_ok = True
+    if has_ffmpeg and not no_subtitle:
+        srt_ok = embed_subtitle(export_path, matched_srt, metadata)
+    
+    # 2. Inject Metadata via exiftool
+    inject_metadata(export_path, metadata)
+    final_status = f"success|{filename}|{metadata.get('datetime','?')}|{metadata.get('latitude',0)},{metadata.get('longitude',0)}"
+    
+    # Track as processed for fast future checks
+    _processed_set.add(filename)
     
     # 3. Delete Source (Create Space)
-    if delete_source and meta_ok and srt_ok:
+    if delete_source and srt_ok:
         recycle_source(matched_srt, export_path)
 
     return final_status
@@ -353,8 +372,10 @@ def main():
     parser.add_argument('src_dir', help="Directory containing original source files (MP4 + SRT)")
     parser.add_argument('export_dir', help="Directory containing exported videos to process")
     parser.add_argument('--force', action='store_true', help="Force processing even if already processed")
-    parser.add_argument('--threads', type=int, default=4, help="Number of concurrent threads (default: 4)")
+    parser.add_argument('--threads', type=int, default=1, help="Number of concurrent threads (default: 1)")
     parser.add_argument('--delete-source', action='store_true', help="Delete original source MP4/MOV after successful injection (Keeps SRT)")
+    parser.add_argument('--no-subtitle', action='store_true', help="Skip ffmpeg subtitle embedding (metadata only, halves disk I/O)")
+    parser.add_argument('--delay', type=int, default=5, help="Seconds to wait between files to let SSD cool down (default: 5, 0 to disable)")
     
     args = parser.parse_args()
     
@@ -362,6 +383,18 @@ def main():
     export_dir = args.export_dir
     force = args.force
     delete_source = args.delete_source
+    no_subtitle = args.no_subtitle
+    
+    # Load processed tracking file for fast re-run checks
+    global _processed_set
+    tracking_path = os.path.join(export_dir, ".dji_processed.json")
+    if os.path.exists(tracking_path) and not force:
+        try:
+            with open(tracking_path, 'r') as f:
+                _processed_set = set(json.load(f))
+            print(f"Loaded {len(_processed_set)} previously processed entries from tracking file.")
+        except Exception:
+            _processed_set = set()
     
     if delete_source:
         print("\n!!! WARNING: --delete-source is ENABLED !!!")
@@ -371,7 +404,9 @@ def main():
         # For batch automation, we skip confirmation.
     
     has_ffmpeg = check_ffmpeg()
-    if has_ffmpeg:
+    if no_subtitle:
+        print(f"\n--no-subtitle: Skipping ffmpeg subtitle embedding (metadata only, 50% less disk I/O).")
+    elif has_ffmpeg:
         print(f"\nFFmpeg detected. Subtitle embedding enabled (using {args.threads} threads).")
     else:
         print(f"\nFFmpeg NOT detected. Skipping subtitle embedding (metadata only).")
@@ -427,13 +462,17 @@ def main():
     already_processed_count = 0
     successful_log = []
     
-    # Prepare task list for executor
-    tasks = []
+    # Process videos sequentially with optional cooldown delay
+    results = []
     for i, (export_path, matched_srt) in enumerate(videos_to_process, 1):
-        tasks.append((export_path, matched_srt, has_ffmpeg, force, delete_source, source_map, total_videos, i))
-
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        results = list(executor.map(process_single_video, tasks))
+        task = (export_path, matched_srt, has_ffmpeg, force, delete_source, source_map, total_videos, i, no_subtitle)
+        result = process_single_video(task)
+        results.append(result)
+        
+        # Cooldown delay between files to reduce sustained SSD heat
+        if args.delay > 0 and i < total_videos and result != "already_processed":
+            safe_print(f"  Cooling down {args.delay}s before next file...")
+            time.sleep(args.delay)
 
     # Tally results
     for res in results:
@@ -458,6 +497,13 @@ def main():
         f.write(f"{'-'*50}\n")
         for entry in successful_log:
             f.write(f"File: {entry[0]} | Date: {entry[1]} | GPS: {entry[2]}\n")
+
+    # Save processed tracking file for fast future re-runs
+    try:
+        with open(tracking_path, 'w') as f:
+            json.dump(sorted(_processed_set), f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save tracking file: {e}")
 
     print(f"\nProcessing complete.")
     print(f"Processed (New): {processed_count}")
