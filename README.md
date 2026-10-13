@@ -15,7 +15,7 @@ It writes GPS and capture dates in metadata fields used by **Google Photos**. Re
 
 ## Prerequisites
 
-1.  **Python 3.6+**: [Download Python](https://www.python.org/downloads/)
+1.  **CPython 3.12–3.14 (tested)**: [Download Python](https://www.python.org/downloads/)
 2.  **ExifTool**: Required for writing metadata.
     *   [Download ExifTool](https://exiftool.org/)
     *   Make sure `exiftool.exe` is in your system PATH or in the same folder as the script.
