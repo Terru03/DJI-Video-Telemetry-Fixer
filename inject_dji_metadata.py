@@ -7,14 +7,14 @@ import argparse
 import subprocess
 import datetime
 import shutil
+import tempfile
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
 
 # Global tracking set for processed files (loaded in main)
 _processed_set = set()
 
-# Lock for clean console output during multi-threading
+# Lock for callers that share console output
 print_lock = threading.Lock()
 
 def safe_print(message):
@@ -40,9 +40,10 @@ def parse_srt_data(srt_path):
                 data['datetime'] = date_match.group(1)
             
             # Regex for GPS and Altitude
-            lat_match = re.search(r'\[latitude\s*:\s*([-+]?\d*\.\d+|\d+)\]', content)
-            lon_match = re.search(r'\[longitude\s*:\s*([-+]?\d*\.\d+|\d+)\]', content)
-            alt_match = re.search(r'abs_alt:\s*([-+]?\d*\.\d+|\d+)', content)
+            number = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)'
+            lat_match = re.search(r'\[latitude\s*:\s*(' + number + r')\]', content)
+            lon_match = re.search(r'\[longitude\s*:\s*(' + number + r')\]', content)
+            alt_match = re.search(r'abs_alt:\s*(' + number + r')(?=\s|\])', content)
             
             if lat_match and lon_match:
                 data['latitude'] = float(lat_match.group(1))
@@ -50,6 +51,8 @@ def parse_srt_data(srt_path):
             
             if alt_match:
                 data['altitude'] = float(alt_match.group(1))
+            elif 'abs_alt:' in content:
+                return None
 
             # Regex for Camera Settings
             # [iso : 100] [shutter : 1/160.0] [fnum : 170]
@@ -80,9 +83,21 @@ def parse_srt_data(srt_path):
         print(f"Error parsing SRT {srt_path}: {e}")
         return None
 
-    if 'latitude' in data and 'longitude' in data:
+    if valid_metadata(data):
         return data
     return None
+
+
+def valid_metadata(metadata):
+    """Require complete, usable GPS and local capture time before modifying media."""
+    try:
+        datetime.datetime.strptime(metadata['datetime'], '%Y-%m-%d %H:%M:%S')
+        lat, lon = float(metadata['latitude']), float(metadata['longitude'])
+        alt = float(metadata.get('altitude', 0))
+        return (all(math.isfinite(value) for value in (lat, lon, alt))
+                and -90 <= lat <= 90 and -180 <= lon <= 180)
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def format_iso6709(lat, lon, alt):
@@ -101,8 +116,8 @@ def inject_metadata(video_path, metadata):
     Uses exiftool to inject GPS and Date metadata into the video file.
     Optimized for Google Photos recognition.
     """
-    if not metadata:
-        return
+    if not valid_metadata(metadata):
+        return False
 
     # Format datetime for exiftool (YYYY:MM:DD HH:MM:SS)
     dt_str = metadata['datetime'].replace('-', ':')
@@ -162,7 +177,7 @@ def inject_metadata(video_path, metadata):
         f'-XMP:GPSAltitude={alt}',
         '-XMP:GPSAltitudeRef=Above Sea Level',
         
-        video_path
+        '--', os.path.abspath(video_path)
     ]
 
     # Add optional camera settings if found
@@ -179,27 +194,72 @@ def inject_metadata(video_path, metadata):
     if 'iso' in metadata:
         safe_print(f"    Cam: ISO {metadata['iso']}, {metadata.get('shutter','')}, f/{metadata.get('fnum','')}")
     
-    # Cleanup any leftover exiftool temp files
-    tmp_path = video_path + "_exiftool_tmp"
-    if os.path.exists(tmp_path):
-        try:
-            os.remove(tmp_path)
-            safe_print(f"    Cleaned up leftover temp file: {os.path.basename(tmp_path)}")
-        except Exception as e:
-            safe_print(f"    Warning: Could not remove {tmp_path}: {e}")
-
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        safe_print("    Success!")
-    except subprocess.CalledProcessError as e:
-        safe_print(f"    Error running exiftool: {e.stderr.decode()}")
+        return True
+    except (subprocess.CalledProcessError, OSError) as e:
+        safe_print(f"    Error running exiftool: {e}")
+        return False
+
+
+def verify_metadata(video_path, metadata):
+    """Read actual Keys GPS/date and QuickTime creation date, not a model hint."""
+    try:
+        result = subprocess.run(
+            ['exiftool', '-j', '-G1', '-n', '-Keys:GPSCoordinates',
+             '-Keys:CreationDate', '-QuickTime:CreateDate', '--', os.path.abspath(video_path)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8')
+        records = json.loads(result.stdout)
+        if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+            return False
+        tags = records[0]
+        gps = [float(value) for value in tags['Keys:GPSCoordinates'].split()]
+        expected = (metadata['latitude'], metadata['longitude'], metadata.get('altitude', 0))
+        # The existing ISO 6709 writer rounds GPS to five decimals and altitude to three.
+        if len(gps) != 3 or not all(
+                math.isfinite(value) and math.isclose(value, wanted, rel_tol=0, abs_tol=tolerance)
+                for value, wanted, tolerance in zip(gps, expected, (0.0000051, 0.0000051, 0.00051))):
+            return False
+        expected_date = metadata['datetime'].replace('-', ':')
+        # Keys:CreationDate may gain a local timezone suffix; SRT has no timezone.
+        creation_date = tags['Keys:CreationDate']
+        if not isinstance(creation_date, str) or not re.fullmatch(
+                re.escape(expected_date) + r'(?:Z|[-+](?:0\d|1\d|2[0-3]):[0-5]\d)?', creation_date):
+            return False
+        return tags['QuickTime:CreateDate'] == expected_date
+    except (subprocess.CalledProcessError, OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def verify_subtitle(video_path):
+    """Require the requested telemetry subtitle in the final exported file."""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 's', '-show_entries',
+             'stream=codec_name:stream_tags=title,handler_name', '-of', 'json', os.path.abspath(video_path)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8')
+        streams = json.loads(result.stdout)['streams']
+        return any(stream.get('codec_name') == 'mov_text'
+                   and 'DJI Telemetry' in (stream.get('tags', {}).get('title'),
+                                          stream.get('tags', {}).get('handler_name'))
+                   for stream in streams)
+    except (subprocess.CalledProcessError, OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
 
 def check_ffmpeg():
     """Checks if ffmpeg is available in the system PATH."""
+    return check_tool('ffmpeg', '-version')
+
+
+def check_tool(program, version_option):
+    """Preflight an executable without modifying any media."""
     try:
-        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run([program, version_option], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=True)
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, OSError):
         return False
 
 def embed_subtitle(video_path, srt_path, metadata=None):
@@ -211,7 +271,9 @@ def embed_subtitle(video_path, srt_path, metadata=None):
     # Create a temp output file
     dir_name = os.path.dirname(video_path)
     base_name = os.path.basename(video_path)
-    temp_output = os.path.join(dir_name, f"temp_{base_name}")
+    fd, temp_output = tempfile.mkstemp(prefix='.dji_', suffix=os.path.splitext(base_name)[1],
+                                       dir=dir_name or '.')
+    os.close(fd)
     
     # FFmpeg command to embed subtitle
     # -c copy (copy video/audio streams)
@@ -219,14 +281,15 @@ def embed_subtitle(video_path, srt_path, metadata=None):
     # -movflags +faststart (move moov atom to start for better playback/seeking)
     cmd = [
         'ffmpeg', '-y', # Overwrite temp if exists
-        '-i', video_path,
-        '-i', srt_path,
+        '-i', os.path.abspath(video_path),
+        '-i', os.path.abspath(srt_path),
+        '-map', '0:v?', '-map', '0:a?', '-map', '1:0',
         '-c', 'copy',
         '-c:s', 'mov_text',
         '-movflags', '+faststart',
         '-metadata:s:s:0', 'language=eng',
-        '-metadata:s:s:0', 'handler_name=Telemetry',
         '-metadata:s:s:0', 'title=DJI Telemetry',
+        '-metadata:s:s:0', 'handler_name=DJI Telemetry',
     ]
     # Piggyback creation_time during remux to reduce exiftool work
     if metadata and 'datetime' in metadata:
@@ -243,7 +306,8 @@ def embed_subtitle(video_path, srt_path, metadata=None):
         safe_print("  Subtitle embedding successful!")
         return True
     except subprocess.CalledProcessError as e:
-        safe_print(f"  Error embedding subtitle: {e.stderr.decode()}")
+        details = (e.stderr or b'').decode('utf-8', errors='replace')
+        safe_print(f"  Error embedding subtitle: {details or str(e)}")
         if os.path.exists(temp_output):
             os.remove(temp_output)
         return False
@@ -256,8 +320,8 @@ def embed_subtitle(video_path, srt_path, metadata=None):
 def check_if_processed(video_path):
     """
     Checks if the video has already been processed by looking for specific metadata.
-    Uses a tracking file first for near-instant checks, then falls back to exiftool.
-    Returns True if valid DJI metadata or subtitle track is found.
+    Uses tracking or camera model only as a hint to request full verification.
+    A True result never establishes successful processing or permits recycling.
     """
     # Fast path: check in-memory tracking set (loaded from .dji_processed.json)
     if os.path.basename(video_path) in _processed_set:
@@ -266,113 +330,114 @@ def check_if_processed(video_path):
     try:
         # Check for our injected Model tag (-fast reads only file header, much less I/O)
         result = subprocess.run(
-            ['exiftool', '-fast', '-Model', '-s3', video_path],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+            ['exiftool', '-fast', '-Model', '-s3', '--', os.path.abspath(video_path)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
         )
         model = result.stdout.strip()
         if "DJI Mini 3 Pro" in model:
-            _processed_set.add(os.path.basename(video_path))
             return True
-            
-        # Check for Telemetry subtitle track using ffprobe (if available)
-        if check_ffmpeg():
-            cmd = [
-                'ffprobe', '-v', 'error', '-select_streams', 's', 
-                '-show_entries', 'stream_tags=title', 
-                '-of', 'default=noprint_wrappers=1:nokey=1', 
-                video_path
-            ]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-            if "DJI Telemetry" in result.stdout:
-                _processed_set.add(os.path.basename(video_path))
-                return True
                 
     except Exception:
         pass
         
     return False
 
-from concurrent.futures import ThreadPoolExecutor
-
 def process_single_video(video_info):
-    """Worker function for parallel processing."""
+    """Process one export; preserve the public nine-element tuple/status API."""
     export_path, matched_srt, has_ffmpeg, force, delete_source, source_map, video_count, current_idx, no_subtitle = video_info
     filename = os.path.basename(export_path)
     
     safe_print(f"[{current_idx}/{video_count}] Processing {filename}...")
     
-    # Check if already processed
-    if not force and check_if_processed(export_path):
-        # We still might want to recycle the source even if the export is already matched/processed
-        if delete_source:
-             recycle_source(matched_srt, export_path)
-        return "already_processed"
-    
-    # 0. Parse metadata first (needed for both ffmpeg and exiftool)
+    # Filename tracking is a hint only; failures must invalidate stale entries.
+    processed_hint = not force and check_if_processed(export_path)
+    _processed_set.discard(filename)
+    if not os.path.isfile(export_path):
+        safe_print("  Error: export video file not found.")
+        return "error"
+    sources = source_video_candidates(matched_srt)
+    if len(sources) > 1 or any(same_file(source, export_path) for source in sources):
+        safe_print("  Error: ambiguous source or source/export refer to the same file.")
+        return "error"
+
     metadata = parse_srt_data(matched_srt)
     if not metadata:
         safe_print(f"  Warning: Could not extract metadata from {os.path.basename(matched_srt)}")
         return "error"
-    
-    # 1. Embed Subtitle (pass metadata so ffmpeg can set creation_time in same pass)
-    srt_ok = True
-    if has_ffmpeg and not no_subtitle:
-        srt_ok = embed_subtitle(export_path, matched_srt, metadata)
-    
-    # 2. Inject Metadata via exiftool
-    inject_metadata(export_path, metadata)
-    final_status = f"success|{filename}|{metadata.get('datetime','?')}|{metadata.get('latitude',0)},{metadata.get('longitude',0)}"
-    
-    # Track as processed for fast future checks
-    _processed_set.add(filename)
-    
-    # 3. Delete Source (Create Space)
-    if delete_source and srt_ok:
-        recycle_source(matched_srt, export_path)
+    if not no_subtitle and not has_ffmpeg:
+        safe_print("  Error: subtitle tools required; use --no-subtitle for metadata only.")
+        return "error"
 
+    if (processed_hint and verify_metadata(export_path, metadata)
+            and (no_subtitle or verify_subtitle(export_path))):
+        _processed_set.add(filename)
+        # Skips never authorize source removal, including legacy cached entries.
+        return "already_processed"
+
+    if not no_subtitle and not embed_subtitle(export_path, matched_srt, metadata):
+        return "error"
+    if not inject_metadata(export_path, metadata) or not verify_metadata(export_path, metadata):
+        safe_print("  Error: metadata write/read-back verification failed; source preserved.")
+        return "error"
+    if not no_subtitle and not verify_subtitle(export_path):
+        safe_print("  Error: subtitle read-back verification failed; source preserved.")
+        return "error"
+    final_status = f"success|{filename}|{metadata.get('datetime','?')}|{metadata.get('latitude',0)},{metadata.get('longitude',0)}"
+    _processed_set.add(filename)
+    if delete_source:
+        recycle_source(matched_srt, export_path)
     return final_status
+
+
+def same_file(first, second):
+    """Reject Windows case aliases, symlinks and hardlinks when identity is available."""
+    if os.path.realpath(os.path.abspath(first)).casefold() == os.path.realpath(os.path.abspath(second)).casefold():
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def source_video_candidates(matched_srt):
+    """Resolve actual case-insensitive sibling MP4/MOV names without picking an ambiguity."""
+    directory = os.path.dirname(os.path.abspath(matched_srt))
+    stem = os.path.splitext(os.path.basename(matched_srt))[0].casefold()
+    try:
+        return [os.path.join(directory, name) for name in os.listdir(directory)
+                if os.path.splitext(name)[0].casefold() == stem
+                and os.path.splitext(name)[1].casefold() in ('.mp4', '.mov')
+                and os.path.isfile(os.path.join(directory, name))]
+    except OSError:
+        return []
+
 
 def recycle_source(matched_srt, export_path):
     """Locates the source video file for an SRT and moves it to the Recycle Bin."""
-    src_dir = os.path.dirname(matched_srt)
-    src_base = os.path.splitext(os.path.basename(matched_srt))[0]
-    
-    # Check for MP4 or MOV
-    potential_srcs = [
-        os.path.join(src_dir, src_base + ".MP4"),
-        os.path.join(src_dir, src_base + ".mp4"),
-        os.path.join(src_dir, src_base + ".MOV"),
-        os.path.join(src_dir, src_base + ".mov")
-    ]
-    
-    for src_vid in potential_srcs:
-        if os.path.exists(src_vid):
-            # SAFETY: Ensure we aren't deleting the export file itself!
-            if os.path.normpath(src_vid) == os.path.normpath(export_path):
-                return
-                
-            try:
-                # Use the VisualBasic Shell API for moving to Recycle Bin (more robust than Remove-Item -Recycle)
-                # We escape double quotes in the path for the PowerShell string
-                escaped_path = src_vid.replace('"', '`"')
-                cmd_recycle = [
-                    'powershell', 
-                    '-Command', 
-                    f'Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile("{escaped_path}", "OnlyErrorDialogs", "SendToRecycleBin")'
-                ]
-                subprocess.run(cmd_recycle, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                safe_print(f"  [SPACE SAVER] Moved original source to Recycle Bin: {os.path.basename(src_vid)}")
-                return
-            except Exception as e:
-                safe_print(f"  Error moving source to Recycle Bin {src_vid}: {e}")
-                return
+    sources = source_video_candidates(matched_srt)
+    if len(sources) != 1 or same_file(sources[0], export_path):
+        return
+    src_vid = sources[0]
+    try:
+        # Fixed code; paths (including $, backticks and quotes) travel only as data.
+        recycle_script = (
+            'Add-Type -AssemblyName Microsoft.VisualBasic; '
+            '[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('
+            '$env:DJI_RECYCLE_SOURCE, "OnlyErrorDialogs", "SendToRecycleBin")')
+        environment = os.environ.copy()
+        environment['DJI_RECYCLE_SOURCE'] = src_vid
+        subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', recycle_script],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=environment)
+        safe_print(f"  [SPACE SAVER] Moved original source to Recycle Bin: {os.path.basename(src_vid)}")
+    except (subprocess.CalledProcessError, OSError) as e:
+        safe_print(f"  Error moving source to Recycle Bin {src_vid}: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Inject DJI GPS data from SRT files into exported videos.")
     parser.add_argument('src_dir', help="Directory containing original source files (MP4 + SRT)")
     parser.add_argument('export_dir', help="Directory containing exported videos to process")
     parser.add_argument('--force', action='store_true', help="Force processing even if already processed")
-    parser.add_argument('--threads', type=int, default=1, help="Number of concurrent threads (default: 1)")
+    parser.add_argument('--threads', type=int, default=1, help="Deprecated compatibility option; processing is always serial (default: 1)")
     parser.add_argument('--delete-source', action='store_true', help="Delete original source MP4/MOV after successful injection (Keeps SRT)")
     parser.add_argument('--no-subtitle', action='store_true', help="Skip ffmpeg subtitle embedding (metadata only, halves disk I/O)")
     parser.add_argument('--delay', type=int, default=5, help="Seconds to wait between files to let SSD cool down (default: 5, 0 to disable)")
@@ -385,8 +450,27 @@ def main():
     delete_source = args.delete_source
     no_subtitle = args.no_subtitle
     
-    # Load processed tracking file for fast re-run checks
     global _processed_set
+    _processed_set = set()
+    if not os.path.isdir(src_dir):
+        print(f"Source directory not found: {src_dir}")
+        return 1
+    if not os.path.isdir(export_dir):
+        print(f"Export directory not found: {export_dir}")
+        return 1
+    if not check_tool('exiftool', '-ver'):
+        print("ExifTool unavailable or failed its version check; install it on PATH.")
+        return 1
+    has_ffmpeg = False
+    if not no_subtitle:
+        has_ffmpeg = check_ffmpeg()
+        if not has_ffmpeg or not check_tool('ffprobe', '-version'):
+            print("FFmpeg and ffprobe required for subtitles; install them or use --no-subtitle.")
+            return 1
+    if args.threads != 1:
+        print("--threads is deprecated and ignored; processing is serial.")
+
+    # Tracking entries are hints and must pass full current-file verification.
     tracking_path = os.path.join(export_dir, ".dji_processed.json")
     if os.path.exists(tracking_path) and not force:
         try:
@@ -398,34 +482,32 @@ def main():
     
     if delete_source:
         print("\n!!! WARNING: --delete-source is ENABLED !!!")
-        print("Original source video files will be moved to the RECYCLE BIN after successful matching.")
+        print("Original source videos move to RECYCLE BIN only after new processing and read-back verification.")
         print("SRT files will be preserved.\n")
         # Optional: Add a pause or confirmation here if running interactively?
         # For batch automation, we skip confirmation.
     
-    has_ffmpeg = check_ffmpeg()
     if no_subtitle:
-        print(f"\n--no-subtitle: Skipping ffmpeg subtitle embedding (metadata only, 50% less disk I/O).")
-    elif has_ffmpeg:
-        print(f"\nFFmpeg detected. Subtitle embedding enabled (using {args.threads} threads).")
+        print("\n--no-subtitle: Skipping subtitle embedding and verification (metadata only).")
     else:
-        print(f"\nFFmpeg NOT detected. Skipping subtitle embedding (metadata only).")
-    
-    if not os.path.exists(src_dir):
-        print(f"Source directory not found: {src_dir}")
-        return
-    if not os.path.exists(export_dir):
-        print(f"Export directory not found: {export_dir}")
-        return
+        print("\nSubtitle embedding enabled. Processing serially.")
 
     # Map source filenames (without extension) to their SRT paths
     source_map = {}
+    ambiguous_sources = set()
     print(f"Scanning source directory: {src_dir} ...")
     for root, dirs, files in os.walk(src_dir):
         for filename in files:
             if filename.lower().endswith('.srt'):
                 base_name = os.path.splitext(filename)[0].lower()
+                if base_name in source_map:
+                    ambiguous_sources.add(base_name)
                 source_map[base_name] = os.path.join(root, filename)
+
+    if ambiguous_sources:
+        print("Ambiguous SRT filenames in source tree: " + ', '.join(sorted(ambiguous_sources)))
+        print("Use source folders with unique SRT filenames; no exports processed.")
+        return 1
             
     print(f"Found {len(source_map)} SRT templates in source directory tree.")
 
@@ -436,7 +518,7 @@ def main():
         for filename in files:
             if filename.lower().endswith(('.mp4', '.mov')):
                 export_path = os.path.join(root, filename)
-                if "_exiftool_tmp" in export_path or "temp_" in filename:
+                if "_exiftool_tmp" in export_path or "temp_" in filename or filename.startswith('.dji_'):
                     continue # Skip our own temp files
                     
                 base_name = os.path.splitext(filename)[0].lower()
@@ -456,7 +538,7 @@ def main():
     total_videos = len(videos_to_process)
     print(f"Found {total_videos} videos with matching source data.")
 
-    # Process in parallel
+    # Process serially; --threads remains accepted for existing batch files.
     processed_count = 0
     skipped_count = 0
     already_processed_count = 0
@@ -510,6 +592,7 @@ def main():
     print(f"Skipped (Already Processed): {already_processed_count}")
     print(f"Skipped (No Match/Error): {total_videos - processed_count - already_processed_count}")
     print(f"Summary saved to: {log_path}")
+    return 1 if skipped_count else 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
