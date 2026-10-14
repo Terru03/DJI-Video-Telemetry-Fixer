@@ -12,10 +12,10 @@ set SOURCE_DIR="C:\Path\To\Your\Source\Folder"
 set EXPORT_DIR="C:\Path\To\Your\Export\Folder"
 
 :: Options:
-:: --threads N        : Number of parallel threads (Default: 4, Recommended: 1 for HDD/SSD safety)
+:: --threads N        : Deprecated/ignored compatibility option (Default: 1); always serial
 :: --delay N          : Seconds to wait between files (Default: 5, Recommended: 5-10 for SSD cooldown)
-:: --no-subtitle      : Skip ffmpeg subtitle embedding (metadata only, saves 50% disk I/O)
-:: --delete-source    : Moves original source MP4 to Recycle Bin after successful processing (Space Saver)
+:: --no-subtitle      : Metadata only; skips ffmpeg/ffprobe, retains GPS/date read-back
+:: --delete-source    : Recycles source only after NEW verified processing; skips preserve source
 :: --force            : Re-process videos even if they already have metadata
 set OPTIONS=--threads 1 --delay 5 
 
